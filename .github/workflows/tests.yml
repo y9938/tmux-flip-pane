@@ -1,0 +1,94 @@
+name: Compatibility tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tmux ${{ matrix.tmux }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        tmux: ['3.7c', '3.8', 'master']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential bison autoconf automake pkg-config libevent-dev libncurses-dev
+
+      - name: Build tmux
+        working-directory: ${{ runner.temp }}
+        env:
+          TMUX_VERSION: ${{ matrix.tmux }}
+        run: |
+          if [[ "$TMUX_VERSION" == master ]]; then
+            git clone --depth 1 --branch master https://github.com/tmux/tmux.git tmux-master
+            cd tmux-master
+            git rev-parse HEAD
+            sh autogen.sh
+          else
+            curl --fail --location --retry 3 \
+              "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" \
+              --output tmux.tar.gz
+            tar -xzf tmux.tar.gz
+            cd "tmux-${TMUX_VERSION}"
+          fi
+          ./configure --prefix="${RUNNER_TEMP}/tmux-install"
+          make -j2
+          make install
+
+      - name: Run tests
+        env:
+          TMUX_TEST_BINARIES: ${{ runner.temp }}/tmux-install/bin/tmux
+          TERM: xterm-256color
+        run: |
+          "$TMUX_TEST_BINARIES" -V
+          python -m unittest discover -s tests -v
+
+  status:
+    name: Publish commit status
+    needs: test
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      statuses: write
+
+    steps:
+      - name: Report compatibility result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          case "$TEST_RESULT" in
+            success)
+              state=success
+              description="All tmux compatibility tests passed"
+              ;;
+            failure)
+              state=failure
+              description="tmux compatibility tests failed"
+              ;;
+            *)
+              state=error
+              description="tmux compatibility tests were cancelled or skipped"
+              ;;
+          esac
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state="$state" \
+            -f context="Compatibility tests" \
+            -f description="$description" \
+            -f target_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --silent
